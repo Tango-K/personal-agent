@@ -1,0 +1,429 @@
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""Tests for the streamed projection of the final agent response.
+
+In streaming mode (``CHRYS_STREAM=true``) the executor emits the final LLM
+response's text as one cumulative ``AgentMessage(is_final=False)`` snapshot
+before the final event: the text arrives buffered whole, so it is never
+replayed line by line.  Intermediate text (text emitted alongside
+``function_call`` content) is NOT streamed — it flows through the existing
+non-streamed intermediate-text handler.
+
+Covers these edge cases:
+- Multi-line final text with LF, CRLF and CR separators, terminated or not
+- Single-line final text (no newline at all)
+- Empty final text
+- Intermediate text before a tool call is not streamed
+- Multiple intermediate responses then a final are all handled
+- Mock streaming order (function_call chunk emitted before text chunk in
+  the same LLM response) still discards the intermediate text
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+from chrys.foundation.events.types import Error, InvocationMessage, UserMessage
+from chrys.orchestration.invoker.contracts import AbortCause
+from chrys.service.llm.mock import MockResponse
+from tests.support.pipeline_helpers import (
+    create_test_engine,
+    error_on_nth,
+    fail_before_response_on_nth,
+    interrupt_on_nth,
+)
+from tests.support.waiting import wait_for
+
+
+def _streaming_chunks(events: list) -> list[str]:
+    """Extract ``is_final=False`` AgentMessage texts (the streamed snapshot)."""
+    return [
+        e.text
+        for e in events
+        if (isinstance(e, InvocationMessage) and e.origin.kind == "turn") and not e.is_final and not e.is_intermediate
+    ]
+
+
+def _finals(events: list) -> list[str]:
+    return [
+        e.text
+        for e in events
+        if (isinstance(e, InvocationMessage) and e.origin.kind == "turn") and e.is_final and not e.is_intermediate
+    ]
+
+
+def _intermediates(events: list) -> list[str]:
+    return [
+        e.text for e in events if (isinstance(e, InvocationMessage) and e.origin.kind == "turn") and e.is_intermediate
+    ]
+
+
+class TestStreamingFinalSnapshot:
+    """Final-response text is published as one is_final=False snapshot."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "line1\nline2\nline3\n",
+            "line1\nline2\nline3",
+            "Hello, world!",
+            "line1\r\nline2\r\nline3\r\n",
+            "line1\r\nline2\r\nline3",
+            "line1\rline2\rline3\r",
+            "line1\rline2\rline3",
+        ],
+        ids=["lf", "lf-unterminated", "single-line", "crlf", "crlf-unterminated", "cr", "cr-unterminated"],
+    )
+    async def test_the_whole_text_is_one_snapshot_before_the_final(self, tmp_path, text):
+        ctx = await create_test_engine([MockResponse(text=text)], tmp_path, stream=True)
+        try:
+            await ctx.send_message("go")
+            assert _streaming_chunks(ctx.events) == [text]
+            assert _finals(ctx.events) == [text]
+            turn_texts = [
+                e
+                for e in ctx.events
+                if isinstance(e, InvocationMessage) and e.origin.kind == "turn" and not e.is_intermediate
+            ]
+            assert [e.is_final for e in turn_texts] == [False, True]
+        finally:
+            await ctx.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_empty_final_text(self, tmp_path, monkeypatch):
+        """Empty final response produces no streaming events.
+
+        ``ResponseValidationMiddleware`` flags empty text as invalid and
+        retries up to ``MAX_RETRIES`` times before returning the last
+        (still-empty) response as-is.  Supply enough empty responses to
+        cover every attempt so the mock doesn't fall back to its
+        "[No more scripted responses]" canned text — the final
+        (exhausted) empty reply should still produce zero streamed chunks.
+        """
+        from chrys.service.agent_middleware.response_validation import (
+            MAX_RETRIES,
+            ResponseValidationMiddleware,
+        )
+
+        # Flatten validation backoff so the test stays fast.
+        monkeypatch.setattr(ResponseValidationMiddleware, "_BACKOFF_SCHEDULE", (0.0,))
+
+        ctx = await create_test_engine(
+            [MockResponse(text="")] * (MAX_RETRIES + 1),
+            tmp_path,
+            stream=True,
+        )
+        try:
+            await ctx.send_message("go")
+            assert _streaming_chunks(ctx.events) == []
+            assert _finals(ctx.events) == [""]
+        finally:
+            await ctx.cleanup()
+
+
+class TestStreamingSkipsIntermediate:
+    """Intermediate text (alongside function_calls) is not streamed."""
+
+    @pytest.mark.asyncio
+    async def test_intermediate_text_is_not_streamed(self, tmp_path):
+        """Text emitted alongside tool calls goes through the intermediate
+        handler, not the streaming path."""
+        ctx = await create_test_engine(
+            [
+                # LLM response 1: text + tool call — intermediate
+                MockResponse(
+                    text="Let me check first\n",
+                    tool_calls=[("echo", "c1", {"message": "x"})],
+                ),
+                # LLM response 2: pure text — the final answer
+                MockResponse(text="All done\n"),
+            ],
+            tmp_path,
+            stream=True,
+        )
+        try:
+            await ctx.send_message("go")
+            chunks = _streaming_chunks(ctx.events)
+            # Only the FINAL response streams.  The intermediate "Let me
+            # check first\n" must NOT appear in streaming chunks.
+            assert "Let me check first\n" not in chunks
+            assert chunks == ["All done\n"]
+
+            # Intermediate text still reaches the TUI via the non-streamed
+            # intermediate handler.
+            assert "Let me check first\n" in _intermediates(ctx.events)
+            assert _finals(ctx.events) == ["All done\n"]
+        finally:
+            await ctx.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_multiple_intermediates_then_final(self, tmp_path):
+        """Two intermediate responses in a row, then a final.  Only the
+        final streams; both intermediates are discarded from the buffer."""
+        ctx = await create_test_engine(
+            [
+                MockResponse(
+                    text="First thought\n",
+                    tool_calls=[("echo", "c1", {"message": "a"})],
+                ),
+                MockResponse(
+                    text="Second thought\n",
+                    tool_calls=[("concat", "c2", {"a": "x", "b": "y"})],
+                ),
+                MockResponse(text="Answer line 1\nAnswer line 2"),
+            ],
+            tmp_path,
+            stream=True,
+        )
+        try:
+            await ctx.send_message("go")
+            chunks = _streaming_chunks(ctx.events)
+            # Only the final response streams.
+            assert chunks == ["Answer line 1\nAnswer line 2"]
+            # Neither intermediate text leaks into streaming chunks.
+            assert not any("thought" in c for c in chunks)
+        finally:
+            await ctx.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_tool_only_response_then_final(self, tmp_path):
+        """A pure-tool-call response (no text at all) followed by a final."""
+        ctx = await create_test_engine(
+            [
+                MockResponse(tool_calls=[("echo", "c1", {"message": "x"})]),
+                MockResponse(text="All done"),
+            ],
+            tmp_path,
+            stream=True,
+        )
+        try:
+            await ctx.send_message("go")
+            assert _streaming_chunks(ctx.events) == ["All done"]
+            assert _finals(ctx.events) == ["All done"]
+        finally:
+            await ctx.cleanup()
+
+
+class TestStreamingUnstartedCallText:
+    """Text streamed with a call the kernel answers without a tool start stays in its own turn."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "outcome",
+        ["completed", "failed", "interrupted", "failed-before-response", "interrupted-before-response"],
+    )
+    async def test_text_is_published_before_the_turn_ends(self, tmp_path, outcome):
+        """The next response's start releases the text; a pass that ends first releases it itself."""
+        ctx = await create_test_engine(
+            [
+                MockResponse(text="Let me look\n", tool_calls=[("no_such_tool", "c1", {})]),
+                MockResponse(text="Done one"),
+                MockResponse(text="Checking\n", tool_calls=[("echo", "c2", {"message": "x"})]),
+                MockResponse(text="Done two"),
+            ],
+            tmp_path,
+            stream=True,
+        )
+
+        async def _collect_error(event: Error) -> None:
+            ctx.events.append(event)
+
+        await ctx.bus.subscribe(Error, _collect_error)
+        try:
+            restore = None
+            if outcome == "failed":
+                restore = error_on_nth(ctx, 2)
+            elif outcome == "interrupted":
+                restore = interrupt_on_nth(ctx, 2)
+            elif outcome.endswith("before-response"):
+                restore = fail_before_response_on_nth(ctx, 2, interrupt=outcome.startswith("interrupted"))
+            await ctx.send_message("first")
+            if restore is not None:
+                restore()
+            first_turn = list(ctx.events)
+            assert _intermediates(first_turn) == ["Let me look\n"]
+            text_at = next(
+                i for i, e in enumerate(first_turn) if isinstance(e, InvocationMessage) and e.is_intermediate
+            )
+            if outcome == "completed":
+                assert _streaming_chunks(first_turn) == ["Done one"]
+                answer_at = next(
+                    i
+                    for i, e in enumerate(first_turn)
+                    if isinstance(e, InvocationMessage) and not e.is_intermediate and e.text == "Done one"
+                )
+                assert text_at < answer_at
+            elif outcome.startswith("failed"):
+                assert text_at < next(i for i, e in enumerate(first_turn) if isinstance(e, Error))
+
+            await ctx.send_message("second")
+            assert "Let me look\n" not in _intermediates(ctx.events[len(first_turn) :])
+        finally:
+            await ctx.bus.unsubscribe(Error, _collect_error)
+            await ctx.cleanup()
+
+
+class TestPassEndRelease:
+    """The pass end publishes text still buffered and always leaves the turn state reset."""
+
+    @pytest.mark.asyncio
+    async def test_an_interrupt_during_the_release_survives_the_reset(self, tmp_path):
+        ctx = await create_test_engine([MockResponse(text="Done")], tmp_path, stream=True)
+        bindings = ctx.engine.current.loaded.bindings
+        buffer = bindings._intermediate_buffer
+        assert buffer is not None
+
+        async def _stop(event: InvocationMessage) -> None:
+            if event.is_intermediate:
+                bindings._interrupt.set_interrupted()
+
+        await ctx.bus.subscribe(InvocationMessage, _stop)
+        try:
+            buffer.store("Let me look\n")
+            bindings.state.running = True
+            await bindings.finished()
+
+            assert _intermediates(ctx.events) == ["Let me look\n"]
+            assert not bindings._interrupt.is_interrupted
+            assert bindings.state.was_interrupted
+            assert bindings.abort_cause() is AbortCause.USER_CANCEL
+            assert not bindings.state.running
+        finally:
+            await ctx.bus.unsubscribe(InvocationMessage, _stop)
+            await ctx.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_settles_a_publication_the_pass_end_waits_for(self, tmp_path, monkeypatch):
+        """A subscriber that never returns cannot hold the close, and nothing it held is delivered after the pass."""
+        monkeypatch.setattr("chrys.orchestration.engine.session_lifecycle._SHUTDOWN_POST_RUN_TIMEOUT_SECONDS", 0.01)
+        ctx = await create_test_engine(
+            [
+                MockResponse(text="Let me look\n", tool_calls=[("no_such_tool", "c1", {})]),
+                MockResponse(text="Done one"),
+            ],
+            tmp_path,
+            stream=True,
+        )
+        bindings = ctx.engine.current.loaded.bindings
+        buffer = bindings._intermediate_buffer
+        validation = bindings._response_validation
+        assert buffer is not None
+        assert validation is not None
+        publishing = asyncio.Event()
+        abandoned = asyncio.Event()
+        delivered: list[str] = []
+
+        async def _stuck(event: InvocationMessage) -> None:
+            if event.is_intermediate:
+                publishing.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    abandoned.set()
+                    raise
+
+        async def _late(event: InvocationMessage) -> None:
+            if event.is_intermediate:
+                delivered.append(event.text)
+
+        await ctx.bus.subscribe(InvocationMessage, _stuck)
+        await ctx.bus.subscribe(InvocationMessage, _late)
+        closed = False
+        try:
+            await ctx.bus.publish(UserMessage(text="first"))
+
+            def _publishing_or_ended() -> bool:
+                run_task = ctx.engine.turns.turn_state.lease.run_task
+                return publishing.is_set() or (run_task is not None and run_task.done())
+
+            await wait_for(_publishing_or_ended, description="the next response start publishing")
+            assert publishing.is_set()
+
+            await ctx.cleanup()
+            closed = True
+
+            assert ctx.engine.turns.turn_state.shutdown_used_cancel_fallback
+            assert abandoned.is_set()
+            assert buffer._publication is None
+            assert delivered == []
+            assert not bindings.state.running
+            assert not bindings._interrupt.is_interrupted
+            assert validation._observation_hook is None
+        finally:
+            await ctx.bus.unsubscribe(InvocationMessage, _stuck)
+            await ctx.bus.unsubscribe(InvocationMessage, _late)
+            if not closed:
+                await ctx.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_a_stop_while_the_next_response_publishes_the_text_still_delivers_it(self, tmp_path):
+        """Stop cancels the next response's start mid-publication; the pass end completes it for every subscriber."""
+        ctx = await create_test_engine(
+            [
+                MockResponse(text="Let me look\n", tool_calls=[("no_such_tool", "c1", {})]),
+                MockResponse(text="Done one"),
+            ],
+            tmp_path,
+            stream=True,
+        )
+        bindings = ctx.engine.current.loaded.bindings
+        publishing = asyncio.Event()
+        gate = asyncio.Event()
+        delivered: list[str] = []
+
+        async def _slow(event: InvocationMessage) -> None:
+            if event.is_intermediate:
+                publishing.set()
+                await gate.wait()
+
+        async def _late(event: InvocationMessage) -> None:
+            if event.is_intermediate:
+                delivered.append(event.text)
+
+        await ctx.bus.subscribe(InvocationMessage, _slow)
+        await ctx.bus.subscribe(InvocationMessage, _late)
+        turn: asyncio.Task[None] | None = None
+        try:
+            turn = asyncio.create_task(ctx.send_message("first"))
+            await wait_for(
+                lambda: publishing.is_set() or turn.done(), description="the next response start publishing the text"
+            )
+            if turn.done():
+                await turn
+            assert publishing.is_set()
+            await ctx.send_interrupt()
+            gate.set()
+            await turn
+
+            assert delivered == ["Let me look\n"]
+            assert _intermediates(ctx.events) == ["Let me look\n"]
+            assert _streaming_chunks(ctx.events) == []
+            assert bindings.state.was_interrupted
+        finally:
+            gate.set()
+            await ctx.bus.unsubscribe(InvocationMessage, _slow)
+            await ctx.bus.unsubscribe(InvocationMessage, _late)
+            await ctx.cleanup()
+            if turn is not None:
+                await asyncio.gather(turn, return_exceptions=True)
+
+
+class TestStreamingDisabled:
+    """With CHRYS_STREAM=false the executor never emits is_final=False text."""
+
+    @pytest.mark.asyncio
+    async def test_no_streaming_events_when_disabled(self, tmp_path):
+        ctx = await create_test_engine(
+            [MockResponse(text="line1\nline2\nline3")],
+            tmp_path,
+            stream=False,
+        )
+        try:
+            await ctx.send_message("go")
+            assert _streaming_chunks(ctx.events) == []
+            assert _finals(ctx.events) == ["line1\nline2\nline3"]
+        finally:
+            await ctx.cleanup()
